@@ -644,7 +644,7 @@ jobs:
 
       - name: Bump version for LED brightness variant
         working-directory: tuya-zigbee-switch
-        run: sed -i 's/^VERSION_PATCH ?= .*/VERSION_PATCH ?= 3/' board.mk && grep VERSION_PATCH board.mk
+        run: echo "1.1.3" > VERSION && cat VERSION
 
       - name: Build firmware for BSEED TS0726 4-gang
         working-directory: tuya-zigbee-switch
