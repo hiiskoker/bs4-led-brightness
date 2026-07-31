@@ -642,6 +642,10 @@ jobs:
         working-directory: tuya-zigbee-switch
         run: make setup_venv
 
+      - name: Bump version for LED brightness variant
+        working-directory: tuya-zigbee-switch
+        run: sed -i 's/^VERSION_PATCH ?= .*/VERSION_PATCH ?= 3/' board.mk && grep VERSION_PATCH board.mk
+
       - name: Build firmware for BSEED TS0726 4-gang
         working-directory: tuya-zigbee-switch
         run: |
