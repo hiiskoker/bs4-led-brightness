@@ -1,0 +1,660 @@
+name: Build BS4 LED Brightness Firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone tuya-zigbee-switch
+        run: git clone https://github.com/romasku/tuya-zigbee-switch.git
+
+      - name: Write patched led.h
+        working-directory: tuya-zigbee-switch
+        run: |
+          cat > src/base_components/led.h << 'EOF_LED_H'
+          #ifndef _LED_H_
+          #define _LED_H_
+          
+          #include "hal/gpio.h"
+          #include "hal/tasks.h"
+          #include <stdint.h>
+          
+          typedef struct {
+              hal_gpio_pin_t pin;
+              uint8_t on_high;
+              uint8_t on;
+              uint16_t blink_times_left;
+              uint16_t blink_time_on;
+              uint16_t blink_time_off;
+              hal_task_t blink_task;
+              /* Software-PWM brightness (0 = off, 254 = full on) */
+              uint8_t brightness;
+              uint8_t pwm_active;
+              uint8_t pwm_phase;   /* 0 = off phase, 1 = on phase */
+              hal_task_t pwm_task;
+          } led_t;
+          
+          /**
+           * @brief Initialize led (set initial state)
+           * @param *led - Led to use
+           * @return none
+           */
+          void led_init(led_t *led);
+          
+          /**
+           * @brief Turn on led at full brightness, canceling any blinking/PWM
+           * @param *led - Led to use
+           * @return none
+           */
+          void led_on(led_t *led);
+          
+          /**
+           * @brief Turn off led, canceling any blinking/PWM
+           * @param *led - Led to use
+           * @return none
+           */
+          void led_off(led_t *led);
+          
+          /**
+           * @brief Set led brightness using software PWM (0=off, 254=full on).
+           *        Values 1-253 produce a 50 Hz PWM with proportional duty cycle.
+           * @param *led       - Led to use
+           * @param brightness - Target brightness (0-254)
+           * @return none
+           */
+          void led_set_brightness(led_t *led, uint8_t brightness);
+          
+          #define LED_BLINK_FOREVER 0xFFFF
+          
+          /**
+           * @brief Start led blinking, will go to off when finished
+           * @param *led - Led to use
+           * on_time_ms - Time led should be on in milliseconds
+           * off_time_ms - Time led should be off in milliseconds
+           * times - Times to repeat blink before returning to fixed state,
+           *         0xFFFF - blink forever
+           * @return none
+           */
+          void led_blink(led_t *led, uint16_t on_time_ms, uint16_t off_time_ms,
+                         uint16_t times);
+          
+          #endif
+          EOF_LED_H
+
+      - name: Write patched led.c
+        working-directory: tuya-zigbee-switch
+        run: |
+          cat > src/base_components/led.c << 'EOF_LED_C'
+          #include "led.h"
+          
+          #include "hal/gpio.h"
+          #include "hal/tasks.h"
+          #include "hal/timer.h"
+          
+          #include <stdio.h>
+          
+          /* Software-PWM period in milliseconds (50 Hz). */
+          #define LED_PWM_PERIOD_MS 20
+          
+          void led_init(led_t *led) {
+              led->brightness = 254;
+              led->pwm_active = 0;
+              led->pwm_phase  = 0;
+              led_off(led);
+          }
+          
+          void led_on(led_t *led) {
+              /* Cancel any running PWM. */
+              led->pwm_active = 0;
+              hal_tasks_unschedule(&led->pwm_task);
+          
+              hal_gpio_write(led->pin, led->on_high);
+              led->on = 1;
+              led->blink_times_left = 0;
+          }
+          
+          void led_off(led_t *led) {
+              /* Cancel any running PWM. */
+              led->pwm_active = 0;
+              hal_tasks_unschedule(&led->pwm_task);
+          
+              hal_gpio_write(led->pin, !led->on_high);
+              led->on = 0;
+              led->blink_times_left = 0;
+          }
+          
+          /* ------------------------------------------------------------------
+           * Software PWM for brightness control
+           * ------------------------------------------------------------------ */
+          
+          static void led_pwm_handler(void *arg) {
+              led_t *led = (led_t *)arg;
+          
+              if (!led->pwm_active)
+                  return;
+          
+              /* Compute on/off durations each cycle so that brightness changes
+               * take effect immediately without requiring a restart. */
+              uint16_t on_ms  = (uint16_t)led->brightness * LED_PWM_PERIOD_MS / 254;
+              uint16_t off_ms = LED_PWM_PERIOD_MS - on_ms;
+          
+              if (led->pwm_phase == 1) {
+                  /* Currently ON â switch off, then schedule the off phase. */
+                  hal_gpio_write(led->pin, !led->on_high);
+                  led->on       = 0;
+                  led->pwm_phase = 0;
+                  hal_tasks_schedule(&led->pwm_task, off_ms > 0 ? off_ms : 1);
+              } else {
+                  /* Currently OFF â switch on, then schedule the on phase. */
+                  hal_gpio_write(led->pin, led->on_high);
+                  led->on       = 1;
+                  led->pwm_phase = 1;
+                  hal_tasks_schedule(&led->pwm_task, on_ms > 0 ? on_ms : 1);
+              }
+          }
+          
+          void led_set_brightness(led_t *led, uint8_t brightness) {
+              /* Cancel any running blink or PWM task. */
+              led->blink_times_left = 0;
+              led->pwm_active       = 0;
+              hal_tasks_unschedule(&led->blink_task);
+              hal_tasks_unschedule(&led->pwm_task);
+          
+              led->brightness = brightness;
+          
+              if (brightness == 0) {
+                  hal_gpio_write(led->pin, !led->on_high);
+                  led->on = 0;
+                  return;
+              }
+          
+              if (brightness >= 254) {
+                  hal_gpio_write(led->pin, led->on_high);
+                  led->on = 1;
+                  return;
+              }
+          
+              /* Start software PWM: begin with the ON phase. */
+              led->pwm_active       = 1;
+              led->pwm_phase        = 1;
+              led->pwm_task.handler = led_pwm_handler;
+              led->pwm_task.arg     = led;
+              hal_tasks_init(&led->pwm_task);
+          
+              uint16_t on_ms = (uint16_t)brightness * LED_PWM_PERIOD_MS / 254;
+              hal_gpio_write(led->pin, led->on_high);
+              led->on = 1;
+              hal_tasks_schedule(&led->pwm_task, on_ms > 0 ? on_ms : 1);
+          }
+          
+          /* ------------------------------------------------------------------
+           * Blinking
+           * ------------------------------------------------------------------ */
+          
+          static void led_blink_handler(void *arg) {
+              led_t *led = (led_t *)arg;
+          
+              if (led->blink_times_left == 0)
+                  return;
+          
+              if (led->on) {
+                  led->on = 0;
+                  hal_gpio_write(led->pin, !led->on_high);
+                  if (led->blink_times_left != LED_BLINK_FOREVER) {
+                      led->blink_times_left--;
+                  }
+                  hal_tasks_schedule(&led->blink_task, led->blink_time_off);
+              } else {
+                  led->on = 1;
+                  hal_gpio_write(led->pin, led->on_high);
+                  hal_tasks_schedule(&led->blink_task, led->blink_time_on);
+              }
+          }
+          
+          void led_blink(led_t *led, uint16_t on_time_ms, uint16_t off_time_ms,
+                         uint16_t times) {
+              /* Cancel any running PWM before starting blink. */
+              led->pwm_active = 0;
+              hal_tasks_unschedule(&led->pwm_task);
+          
+              /* Always set new durations */
+              led->blink_time_on  = on_time_ms;
+              led->blink_time_off = off_time_ms;
+          
+              if (led->blink_times_left != 0) {
+                  /* If we are already blinking, do not reschedule to avoid jumps. */
+                  led->blink_times_left = times;
+                  return;
+              }
+          
+              hal_gpio_write(led->pin, led->on_high);
+              led->on               = 1;
+              led->blink_times_left = times;
+              led->blink_task.handler = led_blink_handler;
+              led->blink_task.arg     = led;
+              hal_tasks_init(&led->blink_task);
+              hal_tasks_schedule(&led->blink_task, on_time_ms);
+          }
+          EOF_LED_C
+
+      - name: Write patched relay_cluster.h
+        working-directory: tuya-zigbee-switch
+        run: |
+          cat > src/zigbee/relay_cluster.h << 'EOF_RC_H'
+          #ifndef _RELAY_CLUSTER_H_
+          #define _RELAY_CLUSTER_H_
+          
+          #include "base_components/led.h"
+          #include "base_components/relay.h"
+          #include <stdint.h>
+          
+          #include "hal/zigbee.h"
+          
+          typedef struct {
+              uint8_t relay_idx;
+              uint8_t endpoint;
+              uint8_t startup_mode;
+              uint8_t indicator_led_mode;
+              /* attr_infos[5]: OnOff, StartUpOnOff, IndicatorMode, IndicatorState,
+               * IndicatorBrightness (last two only when indicator_led != NULL). */
+              hal_zigbee_attribute attr_infos[5];
+              relay_t *relay;
+              led_t   *indicator_led;
+              uint8_t  indicator_state;
+              uint8_t  indicator_brightness; /* 0 = off, 254 = full on (default) */
+          } zigbee_relay_cluster;
+          
+          void relay_cluster_add_to_endpoint(zigbee_relay_cluster *cluster,
+                                             hal_zigbee_endpoint  *endpoint);
+          
+          void relay_cluster_on(zigbee_relay_cluster *cluster);
+          void relay_cluster_off(zigbee_relay_cluster *cluster);
+          void relay_cluster_toggle(zigbee_relay_cluster *cluster);
+          
+          void relay_cluster_report(zigbee_relay_cluster *cluster);
+          
+          void update_relay_clusters(void);
+          
+          void relay_cluster_callback_attr_write_trampoline(uint8_t endpoint,
+                                                            uint16_t attribute_id);
+          
+          #endif
+          EOF_RC_H
+
+      - name: Write patched relay_cluster.c
+        working-directory: tuya-zigbee-switch
+        run: |
+          cat > src/zigbee/relay_cluster.c << 'EOF_RC_C'
+          #include "relay_cluster.h"
+          #include "cluster_common.h"
+          #include "consts.h"
+          #include "device_config/nvm_items.h"
+          #include "hal/nvm.h"
+          #include "hal/printf_selector.h"
+          
+          hal_zigbee_cmd_result_t relay_cluster_callback(zigbee_relay_cluster *cluster,
+                                                         uint8_t command_id,
+                                                         void *cmd_payload,
+                                                         uint16_t cmd_payload_len);
+          hal_zigbee_cmd_result_t relay_cluster_callback_trampoline(uint8_t endpoint,
+                                                                    uint16_t cluster_id,
+                                                                    uint8_t command_id,
+                                                                    void *cmd_payload,
+                                                                    uint16_t cmd_payload_len);
+          
+          hal_zigbee_cmd_result_t relay_cluster_level_callback(zigbee_relay_cluster *cluster,
+                                                               uint8_t command_id,
+                                                               void *cmd_payload,
+                                                               uint16_t cmd_payload_len);
+          hal_zigbee_cmd_result_t relay_cluster_level_callback_trampoline(uint8_t endpoint,
+                                                                          uint16_t cluster_id,
+                                                                          uint8_t command_id,
+                                                                          void *cmd_payload,
+                                                                          uint16_t cmd_payload_len);
+          
+          void relay_cluster_on_relay_change(zigbee_relay_cluster *cluster,
+                                             uint8_t state);
+          void relay_cluster_on_write_attr(zigbee_relay_cluster *cluster,
+                                           uint16_t attribute_id);
+          
+          void relay_cluster_store_attrs_to_nv(zigbee_relay_cluster *cluster);
+          void relay_cluster_load_attrs_from_nv(zigbee_relay_cluster *cluster);
+          void relay_cluster_handle_startup_mode(zigbee_relay_cluster *cluster);
+          
+          void sync_indicator_led(zigbee_relay_cluster *cluster);
+          
+          zigbee_relay_cluster *relay_cluster_by_endpoint[10];
+          
+          void relay_cluster_callback_attr_write_trampoline(uint8_t endpoint,
+                                                            uint16_t attribute_id) {
+              relay_cluster_on_write_attr(relay_cluster_by_endpoint[endpoint],
+                                          attribute_id);
+          }
+          
+          void update_relay_clusters(void) {
+              for (int i = 0; i < 10; i++) {
+                  if (relay_cluster_by_endpoint[i] != NULL) {
+                      sync_indicator_led(relay_cluster_by_endpoint[i]);
+                  }
+              }
+          }
+          
+          void relay_cluster_add_to_endpoint(zigbee_relay_cluster *cluster,
+                                             hal_zigbee_endpoint  *endpoint) {
+              relay_cluster_by_endpoint[endpoint->endpoint] = cluster;
+              cluster->endpoint = endpoint->endpoint;
+          
+              /* Default brightness: full on.  Must be set before NVM load so that
+               * the value is valid even if NVM is empty (first boot / OTA upgrade). */
+              cluster->indicator_brightness = 254;
+          
+              relay_cluster_load_attrs_from_nv(cluster);
+          
+              cluster->relay->callback_param = cluster;
+              cluster->relay->on_change = (relay_callback_t)relay_cluster_on_relay_change;
+          
+              relay_cluster_handle_startup_mode(cluster);
+              sync_indicator_led(cluster);
+          
+              SETUP_ATTR(0, ZCL_ATTR_ONOFF, ZCL_DATA_TYPE_BOOLEAN, ATTR_READONLY,
+                         cluster->relay->on);
+              SETUP_ATTR(1, ZCL_ATTR_START_UP_ONOFF, ZCL_DATA_TYPE_ENUM8, ATTR_WRITABLE,
+                         cluster->startup_mode);
+              if (cluster->indicator_led != NULL) {
+                  SETUP_ATTR(2, ZCL_ATTR_ONOFF_INDICATOR_MODE, ZCL_DATA_TYPE_ENUM8,
+                             ATTR_WRITABLE, cluster->indicator_led_mode);
+                  SETUP_ATTR(3, ZCL_ATTR_ONOFF_INDICATOR_STATE, ZCL_DATA_TYPE_BOOLEAN,
+                             ATTR_WRITABLE, cluster->indicator_state);
+                  SETUP_ATTR(4, ZCL_ATTR_ONOFF_INDICATOR_BRIGHTNESS, ZCL_DATA_TYPE_UINT8,
+                             ATTR_WRITABLE, cluster->indicator_brightness);
+              }
+          
+              endpoint->clusters[endpoint->cluster_count].cluster_id = ZCL_CLUSTER_ON_OFF;
+              endpoint->clusters[endpoint->cluster_count].attribute_count =
+                  cluster->indicator_led != NULL ? 5 : 2;
+              endpoint->clusters[endpoint->cluster_count].attributes = cluster->attr_infos;
+              endpoint->clusters[endpoint->cluster_count].is_server = 1;
+              endpoint->clusters[endpoint->cluster_count].cmd_callback =
+                  relay_cluster_callback_trampoline;
+              endpoint->cluster_count++;
+          
+              endpoint->clusters[endpoint->cluster_count].cluster_id = ZCL_CLUSTER_LEVEL_CONTROL;
+              endpoint->clusters[endpoint->cluster_count].attribute_count = 0;
+              endpoint->clusters[endpoint->cluster_count].attributes = NULL;
+              endpoint->clusters[endpoint->cluster_count].is_server = 1;
+              endpoint->clusters[endpoint->cluster_count].cmd_callback =
+                  relay_cluster_level_callback_trampoline;
+              endpoint->cluster_count++;
+          }
+          
+          hal_zigbee_cmd_result_t relay_cluster_callback_trampoline(uint8_t endpoint,
+                                                                    uint16_t cluster_id,
+                                                                    uint8_t command_id,
+                                                                    void *cmd_payload,
+                                                                    uint16_t cmd_payload_len) {
+              return relay_cluster_callback(relay_cluster_by_endpoint[endpoint], command_id,
+                                            cmd_payload, cmd_payload_len);
+          }
+          
+          hal_zigbee_cmd_result_t relay_cluster_callback(zigbee_relay_cluster *cluster,
+                                                         uint8_t command_id,
+                                                         void *cmd_payload,
+                                                         uint16_t cmd_payload_len) {
+              switch (command_id) {
+                  case ZCL_CMD_ONOFF_ON:
+                  case ZCL_CMD_ON_WITH_RECALL_GLOBAL_SCENE:
+                      relay_cluster_on(cluster);
+                      break;
+          
+                  case ZCL_CMD_ONOFF_OFF:
+                  case ZCL_CMD_OFF_WITH_EFFECT:
+                      relay_cluster_off(cluster);
+                      break;
+          
+                  case ZCL_CMD_ONOFF_TOGGLE:
+                      relay_cluster_toggle(cluster);
+                      break;
+          
+                  default:
+                      printf("Unknown OnOff command: %d\r\n", command_id);
+                      return HAL_ZIGBEE_CMD_SKIPPED;
+              }
+              return HAL_ZIGBEE_CMD_PROCESSED;
+          }
+          
+          hal_zigbee_cmd_result_t relay_cluster_level_callback_trampoline(uint8_t endpoint,
+                                                                          uint16_t cluster_id,
+                                                                          uint8_t command_id,
+                                                                          void *cmd_payload,
+                                                                          uint16_t cmd_payload_len) {
+              return relay_cluster_level_callback(relay_cluster_by_endpoint[endpoint], command_id,
+                                                  cmd_payload, cmd_payload_len);
+          }
+          
+          hal_zigbee_cmd_result_t relay_cluster_level_callback(zigbee_relay_cluster *cluster,
+                                                               uint8_t command_id,
+                                                               void *cmd_payload,
+                                                               uint16_t cmd_payload_len) {
+              switch (command_id) {
+                  case ZCL_CMD_LEVEL_MOVE_TO_LEVEL_WITH_ON_OFF:
+                      if (cmd_payload == NULL || cmd_payload_len < 1) {
+                          return HAL_ZIGBEE_MALFORMED_COMMAND;
+                      }
+                      uint8_t level = *(uint8_t *)cmd_payload;
+                      if (level == 0) {
+                          relay_cluster_off(cluster);
+                      } else {
+                          relay_cluster_on(cluster);
+                      }
+                      break;
+          
+                  default:
+                      printf("Unknown LevelCtrl command: %d\r\n", command_id);
+                      return HAL_ZIGBEE_CMD_SKIPPED;
+              }
+              return HAL_ZIGBEE_CMD_PROCESSED;
+          }
+          
+          void sync_indicator_led(zigbee_relay_cluster *cluster) {
+              if (cluster->indicator_led == NULL) {
+                  return;
+              }
+          
+              if (cluster->indicator_led_mode != ZCL_ONOFF_INDICATOR_MODE_MANUAL) {
+                  if (cluster->indicator_led_mode == ZCL_ONOFF_INDICATOR_MODE_SAME) {
+                      cluster->indicator_state = cluster->relay->on;
+                  } else {
+                      cluster->indicator_state = !cluster->relay->on;
+                  }
+              }
+          
+              if (cluster->indicator_state) {
+                  /* Use software PWM so the user can dim the indicator. */
+                  led_set_brightness(cluster->indicator_led, cluster->indicator_brightness);
+              } else {
+                  led_off(cluster->indicator_led);
+              }
+          
+              hal_zigbee_notify_attribute_changed(cluster->endpoint, ZCL_CLUSTER_ON_OFF,
+                                                  ZCL_ATTR_ONOFF_INDICATOR_STATE);
+          }
+          
+          void relay_cluster_on(zigbee_relay_cluster *cluster) {
+              relay_on(cluster->relay);
+              sync_indicator_led(cluster);
+          }
+          
+          void relay_cluster_off(zigbee_relay_cluster *cluster) {
+              relay_off(cluster->relay);
+              sync_indicator_led(cluster);
+          }
+          
+          void relay_cluster_toggle(zigbee_relay_cluster *cluster) {
+              relay_toggle(cluster->relay);
+              sync_indicator_led(cluster);
+          }
+          
+          void relay_cluster_on_relay_change(zigbee_relay_cluster *cluster,
+                                             uint8_t state) {
+              hal_zigbee_notify_attribute_changed(cluster->endpoint, ZCL_CLUSTER_ON_OFF,
+                                                  ZCL_ATTR_ONOFF);
+              if (cluster->startup_mode == ZCL_START_UP_ONOFF_SET_ONOFF_TOGGLE ||
+                  cluster->startup_mode == ZCL_START_UP_ONOFF_SET_ONOFF_TO_PREVIOUS) {
+                  relay_cluster_store_attrs_to_nv(cluster);
+              }
+          }
+          
+          void relay_cluster_on_write_attr(zigbee_relay_cluster *cluster,
+                                           uint16_t attribute_id) {
+              if (attribute_id == ZCL_ATTR_ONOFF_INDICATOR_STATE ||
+                  attribute_id == ZCL_ATTR_ONOFF_INDICATOR_BRIGHTNESS) {
+                  sync_indicator_led(cluster);
+              }
+              if (cluster->indicator_led_mode != ZCL_ONOFF_INDICATOR_MODE_MANUAL) {
+                  sync_indicator_led(cluster);
+              }
+          
+              relay_cluster_store_attrs_to_nv(cluster);
+          }
+          
+          /* -----------------------------------------------------------------------
+           * NVM persistence
+           * ----------------------------------------------------------------------- */
+          
+          typedef struct {
+              uint8_t on_off;
+              uint8_t startup_mode;
+              uint8_t indicator_led_mode;
+              uint8_t indicator_led_on;
+          } zigbee_relay_cluster_config;
+          
+          static zigbee_relay_cluster_config nv_config_buffer;
+          
+          void relay_cluster_store_attrs_to_nv(zigbee_relay_cluster *cluster) {
+              nv_config_buffer.on_off             = cluster->relay->on;
+              nv_config_buffer.startup_mode       = cluster->startup_mode;
+              nv_config_buffer.indicator_led_mode = cluster->indicator_led_mode;
+              if (cluster->indicator_led != NULL) {
+                  nv_config_buffer.indicator_led_on = cluster->indicator_state;
+              }
+          
+              hal_nvm_write(NV_ITEM_RELAY_CLUSTER_DATA(cluster->relay_idx),
+                            sizeof(zigbee_relay_cluster_config),
+                            (uint8_t *)&nv_config_buffer);
+          
+              /* Store brightness in its own NVM item so the struct layout stays
+               * backward-compatible with older firmware versions. */
+              if (cluster->indicator_led != NULL) {
+                  hal_nvm_write(NV_ITEM_RELAY_BRIGHTNESS(cluster->relay_idx),
+                                sizeof(uint8_t),
+                                &cluster->indicator_brightness);
+              }
+          }
+          
+          void relay_cluster_load_attrs_from_nv(zigbee_relay_cluster *cluster) {
+              hal_nvm_status_t st = hal_nvm_read(
+                  NV_ITEM_RELAY_CLUSTER_DATA(cluster->relay_idx),
+                  sizeof(zigbee_relay_cluster_config), (uint8_t *)&nv_config_buffer);
+          
+              if (st != HAL_NVM_SUCCESS)
+                  return;
+          
+              cluster->startup_mode       = nv_config_buffer.startup_mode;
+              cluster->indicator_led_mode = nv_config_buffer.indicator_led_mode;
+              cluster->indicator_state    = nv_config_buffer.indicator_led_on;
+          
+              /* Load brightness separately; default (254) was set before this call. */
+              uint8_t brightness = 254;
+              hal_nvm_status_t bst = hal_nvm_read(
+                  NV_ITEM_RELAY_BRIGHTNESS(cluster->relay_idx),
+                  sizeof(uint8_t), &brightness);
+              if (bst == HAL_NVM_SUCCESS) {
+                  cluster->indicator_brightness = brightness;
+              }
+          }
+          
+          void relay_cluster_handle_startup_mode(zigbee_relay_cluster *cluster) {
+              hal_nvm_status_t st = hal_nvm_read(
+                  NV_ITEM_RELAY_CLUSTER_DATA(cluster->relay_idx),
+                  sizeof(zigbee_relay_cluster_config), (uint8_t *)&nv_config_buffer);
+          
+              if (st != HAL_NVM_SUCCESS)
+                  return;
+          
+              uint8_t prev_on = nv_config_buffer.on_off;
+          
+              switch (cluster->startup_mode) {
+                  case ZCL_START_UP_ONOFF_SET_ONOFF_TO_OFF:
+                      relay_cluster_off(cluster);
+                      break;
+          
+                  case ZCL_START_UP_ONOFF_SET_ONOFF_TO_ON:
+                      relay_cluster_on(cluster);
+                      break;
+          
+                  case ZCL_START_UP_ONOFF_SET_ONOFF_TOGGLE:
+                      if (prev_on) {
+                          relay_cluster_off(cluster);
+                      } else {
+                          relay_cluster_on(cluster);
+                      }
+                      break;
+          
+                  case ZCL_START_UP_ONOFF_SET_ONOFF_TO_PREVIOUS:
+                      if (prev_on) {
+                          relay_cluster_on(cluster);
+                      } else {
+                          relay_cluster_off(cluster);
+                      }
+                      break;
+              }
+          
+              /* Restore indicator LED state */
+              sync_indicator_led(cluster);
+          }
+          EOF_RC_C
+
+      - name: Patch consts.h and nvm_items.h
+        working-directory: tuya-zigbee-switch
+        run: |
+          sed -i 's|#define ZCL_ATTR_ONOFF_INDICATOR_STATE 0xff02|#define ZCL_ATTR_ONOFF_INDICATOR_STATE 0xff02\n#define ZCL_ATTR_ONOFF_INDICATOR_BRIGHTNESS 0xff03|' src/zigbee/consts.h
+          sed -i 's|#endif /\* DEVICE_CONFIG_NVM_ITEMS_H_ \*/|#define NV_ITEM_RELAY_BRIGHTNESS(relay_idx) (35 + relay_idx)\n\n#endif /* DEVICE_CONFIG_NVM_ITEMS_H_ */|' src/device_config/nvm_items.h
+          echo "--- consts.h (brightness line) ---"
+          grep -n BRIGHTNESS src/zigbee/consts.h
+          echo "--- nvm_items.h (last 5 lines) ---"
+          tail -5 src/device_config/nvm_items.h
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq make python3 python3-venv unzip wget
+
+      - name: Download Telink toolchain and Zigbee SDK
+        working-directory: tuya-zigbee-switch
+        run: make telink/tools/all
+
+      - name: Set up Python venv
+        working-directory: tuya-zigbee-switch
+        run: make setup_venv
+
+      - name: Build firmware for BSEED TS0726 4-gang
+        working-directory: tuya-zigbee-switch
+        run: |
+          source .venv/bin/activate
+          BOARD=SWITCH_BSEED_TS0726_4GANG DEVICE_TYPE=router make board/build
+
+      - name: Show output files
+        working-directory: tuya-zigbee-switch
+        run: find bin/router/SWITCH_BSEED_TS0726_4GANG/ -name "*.zigbee" -o -name "*.bin" | head -20
+
+      - name: Upload OTA firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bs4-led-brightness-firmware
+          path: tuya-zigbee-switch/bin/router/SWITCH_BSEED_TS0726_4GANG/*.zigbee
+          if-no-files-found: error
