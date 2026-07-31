@@ -144,13 +144,13 @@ jobs:
               uint16_t off_ms = LED_PWM_PERIOD_MS - on_ms;
           
               if (led->pwm_phase == 1) {
-                  /* Currently ON â switch off, then schedule the off phase. */
+                  /* Currently ON -- switch off, then schedule the off phase. */
                   hal_gpio_write(led->pin, !led->on_high);
                   led->on       = 0;
                   led->pwm_phase = 0;
                   hal_tasks_schedule(&led->pwm_task, off_ms > 0 ? off_ms : 1);
               } else {
-                  /* Currently OFF â switch on, then schedule the on phase. */
+                  /* Currently OFF -- switch on, then schedule the on phase. */
                   hal_gpio_write(led->pin, led->on_high);
                   led->on       = 1;
                   led->pwm_phase = 1;
