@@ -652,11 +652,42 @@ jobs:
         working-directory: tuya-zigbee-switch
         run: find bin/router/SWITCH_BSEED_TS0726_4GANG/ -name "*.zigbee" -o -name "*.bin" | head -20
 
+      - name: Generate OTA index
+        working-directory: tuya-zigbee-switch
+        run: |
+          source .venv/bin/activate
+          python3 - << 'PYEOF'
+          import struct, hashlib, json, glob
+          BASE = 'https://github.com/hiiskoker/bs4-led-brightness/releases/download/firmware-latest'
+          d = 'bin/router/SWITCH_BSEED_TS0726_4GANG'
+          def parse(p):
+              data = open(p,'rb').read()
+              mfr  = struct.unpack_from('<H',data,10)[0]
+              itype= struct.unpack_from('<H',data,12)[0]
+              fver = struct.unpack_from('<I',data,14)[0]
+              ostr = data[20:52].rstrip(b'\x00').decode('ascii','replace')
+              return {'manufacturerCode':mfr,'imageType':itype,'fileVersion':fver,
+                      'fileSize':len(data),'otaHeaderString':ostr,
+                      'sha512':hashlib.sha512(data).hexdigest()}
+          entries=[]
+          for p in sorted(glob.glob(f'{d}/*.zigbee')):
+              if 'forced' in p: continue
+              e=parse(p)
+              n='bs4-led-brightness-from-tuya.zigbee' if 'from_tuya' in p else 'bs4-led-brightness.zigbee'
+              e.update({'fileName':n,'url':f'{BASE}/{n}','manufacturerName':['_TZ3002_pzao9ls1','pzao9ls1']})
+              entries.append(e)
+          entries.sort(key=lambda x:x['fileVersion'])
+          open('../ota_index.json','w').write(json.dumps(entries,indent=2))
+          print(json.dumps(entries,indent=2))
+          PYEOF
+
       - name: Upload OTA firmware artifact
         uses: actions/upload-artifact@v4
         with:
           name: bs4-led-brightness-firmware
-          path: tuya-zigbee-switch/bin/router/SWITCH_BSEED_TS0726_4GANG/*.zigbee
+          path: |
+            tuya-zigbee-switch/bin/router/SWITCH_BSEED_TS0726_4GANG/*.zigbee
+            ota_index.json
           if-no-files-found: error
 
   build-original:
@@ -711,11 +742,27 @@ jobs:
           name: bs4-original-firmware
           path: fw-original/
 
-      - name: Rename files
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rename and stage files
         run: |
-          find fw-brightness/ -name "*.zigbee" | xargs -I{} cp {} bs4-led-brightness.zigbee
-          find fw-original/  -name "*.zigbee" | xargs -I{} cp {} bs4-original-rollback.zigbee
-          ls -la *.zigbee
+          find fw-brightness/ -name "*.zigbee" ! -name "*from_tuya*" ! -name "*forced*" | head -1 | xargs -I{} cp {} bs4-led-brightness.zigbee
+          find fw-brightness/ -name "*from_tuya*.zigbee" | head -1 | xargs -I{} cp {} bs4-led-brightness-from-tuya.zigbee
+          find fw-original/  -name "*.zigbee" ! -name "*from_tuya*" ! -name "*forced*" | head -1 | xargs -I{} cp {} bs4-original-rollback.zigbee
+          cp fw-brightness/ota_index.json ota_index.json
+          ls -la *.zigbee ota_index.json
+
+      - name: Commit OTA index to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
+          git add ota_index.json
+          git diff --cached --quiet || git commit -m "Update OTA index [skip ci]"
+          git push
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -728,5 +775,7 @@ jobs:
             - **bs4-original-rollback.zigbee** -- Original romasku firmware (rollback)
           files: |
             bs4-led-brightness.zigbee
+            bs4-led-brightness-from-tuya.zigbee
             bs4-original-rollback.zigbee
+            ota_index.json
           make_latest: true
