@@ -622,8 +622,8 @@ jobs:
       - name: Patch consts.h and nvm_items.h
         working-directory: tuya-zigbee-switch
         run: |
-          sed -i 's|#define ZCL_ATTR_ONOFF_INDICATOR_STATE 0xff02|#define ZCL_ATTR_ONOFF_INDICATOR_STATE 0xff02\n#define ZCL_ATTR_ONOFF_INDICATOR_BRIGHTNESS 0xff03|' src/zigbee/consts.h
-          sed -i 's|#endif /\* DEVICE_CONFIG_NVM_ITEMS_H_ \*/|#define NV_ITEM_RELAY_BRIGHTNESS(relay_idx) (35 + relay_idx)\n\n#endif /* DEVICE_CONFIG_NVM_ITEMS_H_ */|' src/device_config/nvm_items.h
+          sed -i '/^#define ZCL_ATTR_ONOFF_INDICATOR_STATE/a #define ZCL_ATTR_ONOFF_INDICATOR_BRIGHTNESS 0xff03' src/zigbee/consts.h
+          sed -i '/^#endif.*DEVICE_CONFIG_NVM_ITEMS_H_/i #define NV_ITEM_RELAY_BRIGHTNESS(relay_idx) (35 + relay_idx)' src/device_config/nvm_items.h
           echo "--- consts.h (brightness line) ---"
           grep -n BRIGHTNESS src/zigbee/consts.h
           echo "--- nvm_items.h (last 5 lines) ---"
