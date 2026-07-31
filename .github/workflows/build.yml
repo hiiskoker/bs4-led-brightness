@@ -658,3 +658,75 @@ jobs:
           name: bs4-led-brightness-firmware
           path: tuya-zigbee-switch/bin/router/SWITCH_BSEED_TS0726_4GANG/*.zigbee
           if-no-files-found: error
+
+  build-original:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone tuya-zigbee-switch
+        run: git clone https://github.com/romasku/tuya-zigbee-switch.git
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq make python3 python3-venv unzip wget
+
+      - name: Download Telink toolchain and Zigbee SDK
+        working-directory: tuya-zigbee-switch
+        run: make telink/tools/all
+
+      - name: Set up Python venv
+        working-directory: tuya-zigbee-switch
+        run: make setup_venv
+
+      - name: Build original (unpatched) firmware
+        working-directory: tuya-zigbee-switch
+        run: |
+          source .venv/bin/activate
+          BOARD=SWITCH_BSEED_TS0726_4GANG DEVICE_TYPE=router make board/build
+
+      - name: Upload original firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bs4-original-firmware
+          path: tuya-zigbee-switch/bin/router/SWITCH_BSEED_TS0726_4GANG/*.zigbee
+          if-no-files-found: error
+
+  release:
+    needs: [build, build-original]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download LED brightness firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: bs4-led-brightness-firmware
+          path: fw-brightness/
+
+      - name: Download original firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: bs4-original-firmware
+          path: fw-original/
+
+      - name: Rename files
+        run: |
+          find fw-brightness/ -name "*.zigbee" | xargs -I{} cp {} bs4-led-brightness.zigbee
+          find fw-original/  -name "*.zigbee" | xargs -I{} cp {} bs4-original-rollback.zigbee
+          ls -la *.zigbee
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: firmware-latest
+          name: Latest Firmware Build
+          body: |
+            Auto-built from latest commit.
+            - **bs4-led-brightness.zigbee** -- LED brightness firmware (flash this)
+            - **bs4-original-rollback.zigbee** -- Original romasku firmware (rollback)
+          files: |
+            bs4-led-brightness.zigbee
+            bs4-original-rollback.zigbee
+          make_latest: true
