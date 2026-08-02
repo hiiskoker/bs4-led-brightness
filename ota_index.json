@@ -3,9 +3,9 @@
     "manufacturerCode": 4417,
     "imageType": 43627,
     "fileVersion": 285421568,
-    "fileSize": 181458,
+    "fileSize": 181442,
     "otaHeaderString": "Telink OTA Image",
-    "sha512": "abc750849e0c4dd4ebc0e941e0f91f4e70387c040b79214d2b293be8ff3f2c045535ff90a739135b1f797545aec542de7af201485de50462cce673d39fa4620e",
+    "sha512": "c2bdf3af6450e4dc1bbf6282d295791f85d3edbcf26c948f82f87da5bad879a3537ac728346977e54fe47dc7f6502cebc6620fc81dc359ddf267596843a7c536",
     "fileName": "bs4-led-brightness.zigbee",
     "url": "https://github.com/hiiskoker/bs4-led-brightness/releases/download/firmware-latest/bs4-led-brightness.zigbee",
     "manufacturerName": [
@@ -17,9 +17,9 @@
     "manufacturerCode": 4417,
     "imageType": 54179,
     "fileVersion": 4294967295,
-    "fileSize": 181458,
+    "fileSize": 181442,
     "otaHeaderString": "Telink OTA Image",
-    "sha512": "2f8bbdf9e40aebf08307add82c8292612507739e389481f0b747fb1f9305a76a96d01269e8a9fbd316c387ef841b10a045d05af27d27dcf9937e819448bc971d",
+    "sha512": "e1bfc4564567c62892ce1bdc878ac02ef2da5dc47d59d502c82c870a9b27c51a4add7505817c5911a6181754a4fcd29024c5824a002cba94a1692e918f09cc27",
     "fileName": "bs4-led-brightness-from-tuya.zigbee",
     "url": "https://github.com/hiiskoker/bs4-led-brightness/releases/download/firmware-latest/bs4-led-brightness-from-tuya.zigbee",
     "manufacturerName": [
